@@ -1,43 +1,63 @@
 # Render Blueprint for Dukaan Sathi.
 #
-# One web service runs everything: the Express API and the built React SPA are
-# the same Node process, so the browser talks to a single origin and there is no
-# CORS allowlist to keep in sync.
+# Two services, both on Render, nothing else to sign up for:
 #
-# The build installs all three workspaces and then builds the client, because
-# `npm start` only serves `client/dist` if it exists at boot.
+#   dukaan-sathi        web service  - Express API + the built React SPA
+#   dukaan-sathi-mongo  private      - MongoDB 8, unreachable from the internet
+#
+# One web service runs both halves of the app: Express serves `client/dist` when
+# it exists, so the browser talks to a single origin and there is no CORS
+# allowlist to keep in sync.
+#
+# The MongoDB is a *private* service, which is what removes MongoDB Atlas from the
+# picture. It gets no onrender.com subdomain and no public IP; the only way in is
+# over Render's private network from the web service, same workspace and region.
+# No IP allowlist to widen, no database password to leak.
 
 services:
+  # ---------------------------------------------------------------------------
+  # The app.
+  # ---------------------------------------------------------------------------
   - type: web
     name: dukaan-sathi
     runtime: node
+    # Free is enough for the app: it may *send* private network traffic to a paid
+    # service, so it can still reach the database. The trade is the free tier's
+    # 15-minute idle sleep, which costs ~30s on the first voice command after a
+    # gap. Change to `plan: starter` when that starts mattering.
     plan: free
+    # Private networking only works inside one region. The database below must
+    # match this.
     region: singapore
 
-    # `install:all` is root + server + client. The build must run before start,
-    # otherwise the server boots with no client and only answers /api.
+    # `install:all` covers root + server + client. The client build has to happen
+    # before start, or the server boots with no client and answers only /api.
     buildCommand: npm run install:all && npm run build
     startCommand: npm start
 
-    # Hits MongoDB, so a database blip shows up as a failed deploy instead of a
-    # silently broken app.
+    # Hits MongoDB, so a database that is unreachable fails the deploy instead of
+    # shipping an app that 500s on the first page load.
     healthCheckPath: /api/health
 
-    # Free instances sleep after 15 minutes idle, so the first voice command
-    # after a gap waits out a cold start. Move to `plan: starter` to remove it.
-    autoDeploy: true
-
     envVars:
-      # Required, filled in at deploy time. Never committed, never in the bundle.
+      # Render resolves the database's internal hostname - which carries a suffix
+      # you cannot predict - and injects it here. config/env.js assembles the
+      # connection string from this, so there is nothing to paste by hand.
+      - key: MONGODB_HOST
+        fromService:
+          name: dukaan-sathi-mongo
+          type: pserv
+          property: host
+      - key: MONGODB_PORT
+        value: "27017"
+      - key: MONGODB_DB
+        value: dukaan_sathi
+
+      # Required, filled in at deploy time. Server-side only, never in the bundle.
       - key: GEMINI_API_KEY
         sync: false
 
-      # MongoDB Atlas SRV string. The free Render plan has no fixed outbound IP,
-      # so Atlas network access has to allow 0.0.0.0/0 - see README "Deploy".
-      - key: MONGODB_URI
-        sync: false
-
-      # The shop key. Generated once by Render and shown in the dashboard; the
+      # The shop key. Generated once by Render and read off the dashboard; the
       # shopkeeper types it into the app on first load.
       - key: API_KEY
         generateValue: true
@@ -46,9 +66,9 @@ services:
       - key: NODE_ENV
         value: production
 
-      # Set this to the deployed origin, e.g. https://dukaan-sathi.onrender.com
-      # (comma-separated for extra origins). Leave it unset while the app is
-      # same-origin only: same-origin requests are not subject to CORS.
+      # Only matters for cross-origin calls, and the SPA is served by this same
+      # process, so leaving it unset still works. Set it if you later split the
+      # client onto its own host.
       - key: CLIENT_ORIGIN
         sync: false
 
@@ -62,7 +82,7 @@ services:
         value: "0.75"
 
       # Every voice command is one billable Gemini call, so this budget is what
-      # caps the shop's spend if a client misbehaves.
+      # caps what a misbehaving client can spend.
       - key: RATE_LIMIT_VOICE_MAX
         value: "20"
 
@@ -74,3 +94,28 @@ services:
 
       - key: MAX_AUDIO_BYTES
         value: "10485760"
+
+  # ---------------------------------------------------------------------------
+  # MongoDB.
+  #
+  # `plan` cannot be `free` here: persistent disks are a paid-plan feature, and
+  # without a disk the database would be wiped on every restart and redeploy -
+  # which for an inventory app means the shop's stock silently resets to the
+  # 5-item seed. The cheapest private service is `0.5c-512mb`.
+  #
+  # `region` must match the web service above or the private network will not
+  # route between them.
+  # ---------------------------------------------------------------------------
+  - type: pserv
+    name: dukaan-sathi-mongo
+    runtime: docker
+    dockerfilePath: ./infra/mongo/Dockerfile
+    plan: 0.5c-512mb
+    region: singapore
+
+    disk:
+      name: mongo-data
+      # The official image's declared data directory. A disk mounted anywhere
+      # else starts a mongod with an empty data directory and writes nothing.
+      mountPath: /data/db
+      sizeGB: 1

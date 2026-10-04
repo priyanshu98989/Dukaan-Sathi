@@ -46,9 +46,37 @@ if (!API_KEY && !API_KEY_ALLOW_ANONYMOUS) {
 const RATE_LIMIT_VOICE_MAX = num('RATE_LIMIT_VOICE_MAX', process.env.RATE_LIMIT_VOICE_MAX, 20);
 const RATE_LIMIT_READ_MAX = num('RATE_LIMIT_READ_MAX', process.env.RATE_LIMIT_READ_MAX, 120);
 
+/**
+ * Where the database is.
+ *
+ * `MONGODB_URI` is the normal form and stays the only one you need locally. It
+ * exists because a hosting platform can hand out the pieces of a connection
+ * string separately but cannot concatenate them: Render's Blueprint can inject
+ * another service's internal hostname via `fromService`, but it cannot turn
+ * that into `mongodb://<host>:27017/<db>`. So `MONGODB_HOST` is accepted as an
+ * alternative, and the URI is assembled here where it can actually be joined.
+ *
+ * `MONGODB_URI` wins if both are present, so an explicit URI is never silently
+ * overridden by a hostname that happens to be in the environment too.
+ */
+const MONGO_HOST = String(process.env.MONGODB_HOST || '').trim();
+const MONGO_PORT = num('MONGODB_PORT', process.env.MONGODB_PORT, 27017);
+const MONGO_DB = String(process.env.MONGODB_DB || 'dukaan_sathi').trim();
+
+function resolveMongoUri() {
+  const explicit = String(process.env.MONGODB_URI || '').trim();
+  if (explicit) return required('MONGODB_URI', explicit);
+  if (MONGO_HOST) return `mongodb://${MONGO_HOST}:${MONGO_PORT}/${MONGO_DB}`;
+  throw new Error(
+    'Missing required environment variable MONGODB_URI. Set it to a full connection ' +
+      'string, or set MONGODB_HOST (plus optionally MONGODB_PORT and MONGODB_DB) and it ' +
+      'will be assembled for you.',
+  );
+}
+
 export const config = {
   port: PORT,
-  mongoUri: required('MONGODB_URI', process.env.MONGODB_URI),
+  mongoUri: resolveMongoUri(),
   geminiApiKey: required('GEMINI_API_KEY', process.env.GEMINI_API_KEY),
   geminiModel: process.env.GEMINI_MODEL || 'gemini-flash-lite-latest',
   clientOrigin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
