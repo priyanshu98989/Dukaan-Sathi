@@ -93,6 +93,19 @@ async function getJson(path) {
   return { status: res.status, body: await res.json() };
 }
 
+/** The api tests run with the auth escape hatch on, so no key is needed. */
+function sendJson(method, path, payload) {
+  return fetch(`${baseUrl}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(async (res) => ({ status: res.status, body: await res.json() }));
+}
+
+const postJson = (path, payload) => sendJson('POST', path, payload);
+const putJson = (path, payload) => sendJson('PUT', path, payload);
+const deleteJson = (path) => sendJson('DELETE', path, {});
+
 async function qty(name) {
   return (await InventoryItem.findOne({ name })).quantity;
 }
@@ -109,6 +122,13 @@ async function setQuantities(map) {
 
 async function resetStock() {
   await setQuantities({});
+  // Item-CRUD tests add rows, and every other test asserts on exact counts and on
+  // item resolution. Leaving a "Chawal" behind would break both, so the seeded
+  // set is restored before each test.
+  const extra = await InventoryItem.find({ nameKey: { $nin: Object.keys(SEED_QTY).map(normaliseKey) } })
+    .select('_id')
+    .lean();
+  if (extra.length) await InventoryItem.deleteMany({ _id: { $in: extra.map((d) => d._id) } });
 }
 
 /** Program the stubbed AI layer with one specific response. */
@@ -650,5 +670,345 @@ describe('concurrent sales cannot drive stock negative', () => {
     assert.equal(await qty('Aata'), 3);
     assert.equal(results.filter((r) => r.status === 'success').length, 1);
     assert.equal(results.filter((r) => r.code === 'INSUFFICIENT_STOCK').length, 1);
+  });
+});
+
+describe('add item', () => {
+  it('stores a new item and reports it back with its low-stock status', async () => {
+    const { status, body } = await postJson('/api/items', {
+      name: 'Chawal',
+      unit: 'kg',
+      quantity: 20,
+      lowStockThreshold: 5,
+    });
+
+    assert.equal(status, 201);
+    assert.equal(body.status, 'success');
+    assert.equal(body.item.name, 'Chawal');
+    assert.equal(body.item.quantity, 20);
+    assert.equal(body.item.unit, 'kg');
+    assert.equal(body.item.lowStockThreshold, 5);
+    assert.equal(body.item.status, 'Normal');
+    assert.equal(body.message, 'Chawal add ho gaya: 20 kg.');
+
+    const stored = await InventoryItem.findOne({ name: 'Chawal' }).lean();
+    assert.ok(stored, 'the row must be in MongoDB');
+    assert.equal(stored.nameKey, 'chawal', 'the case-insensitive key is stored');
+  });
+
+  it('refuses a duplicate name whatever the casing, and keeps the original row', async () => {
+    const created = await postJson('/api/items', {
+      name: 'Chawal',
+      unit: 'kg',
+      quantity: 20,
+      lowStockThreshold: 5,
+    });
+    assert.equal(created.status, 201);
+
+    for (const dupe of ['chawal', 'CHAWAL', '  Chawal  ', 'ChaWal']) {
+      const again = await postJson('/api/items', {
+        name: dupe,
+        unit: 'L',
+        quantity: 3,
+        lowStockThreshold: 1,
+      });
+      assert.equal(again.status, 409, `"${dupe}" should be rejected as a duplicate`);
+      assert.equal(again.body.code, 'DUPLICATE_ITEM');
+      assert.match(again.body.message, /already inventory mein hai/);
+    }
+
+    assert.equal(await InventoryItem.countDocuments({ nameKey: 'chawal' }), 1);
+    assert.equal(await qty('Chawal'), 20, 'the original row must be untouched');
+  });
+
+  it('accepts a unit written the way it is spoken, and stores the canonical one', async () => {
+    const { status, body } = await postJson('/api/items', {
+      name: 'Doodh',
+      unit: 'litre',
+      quantity: 12,
+      lowStockThreshold: 3,
+    });
+
+    assert.equal(status, 201);
+    assert.equal(body.item.unit, 'L', '"litre" is stored as "L"');
+  });
+
+  it('rejects a negative quantity and a negative threshold, writing nothing', async () => {
+    for (const bad of [
+      { name: 'BadOne', unit: 'kg', quantity: -4, lowStockThreshold: 1 },
+      { name: 'BadTwo', unit: 'kg', quantity: 4, lowStockThreshold: -1 },
+    ]) {
+      const { status, body } = await postJson('/api/items', bad);
+      assert.equal(status, 400, `${bad.name} should be rejected`);
+      assert.equal(body.code, 'INVALID_ITEM');
+      assert.match(body.message, /zero ya usse zyada honi chahiye/);
+    }
+
+    assert.equal(await InventoryItem.countDocuments({ nameKey: { $in: ['badone', 'badtwo'] } }), 0);
+  });
+
+  it('rejects a missing name, a blank name and an unusable unit in Hinglish', async () => {
+    const blank = await postJson('/api/items', { name: '   ', unit: 'kg', quantity: 1, lowStockThreshold: 1 });
+    assert.equal(blank.status, 400);
+    assert.match(blank.body.message, /Item ka naam likhein/);
+
+    const missing = await postJson('/api/items', { unit: 'kg', quantity: 1, lowStockThreshold: 1 });
+    assert.equal(missing.status, 400);
+    assert.match(missing.body.message, /Item ka naam likhein/);
+
+    const badUnit = await postJson('/api/items', { name: 'Dabba', unit: 'dabba', quantity: 1, lowStockThreshold: 1 });
+    assert.equal(badUnit.status, 400);
+    assert.match(badUnit.body.message, /Unit chunein: kg, L ya packets/);
+
+    const noQty = await postJson('/api/items', { name: 'Khali', unit: 'kg', lowStockThreshold: 1 });
+    assert.equal(noQty.status, 400);
+    assert.match(noQty.body.message, /Quantity ek number likhein/);
+  });
+});
+
+describe('edit item', () => {
+  async function addChawal() {
+    const res = await postJson('/api/items', {
+      name: 'Chawal',
+      unit: 'kg',
+      quantity: 20,
+      lowStockThreshold: 5,
+    });
+    assert.equal(res.status, 201);
+    return res.body.item;
+  }
+
+  it('corrects the quantity alone, leaving the name and unit alone', async () => {
+    const item = await addChawal();
+
+    const { status, body } = await putJson(`/api/items/${item.id}`, { quantity: 12.5 });
+
+    assert.equal(status, 200);
+    assert.equal(body.item.quantity, 12.5);
+    assert.equal(body.item.name, 'Chawal');
+    assert.equal(body.item.unit, 'kg');
+    assert.equal(body.message, 'Chawal update ho gaya: 12.5 kg.');
+    assert.equal(await qty('Chawal'), 12.5);
+  });
+
+  it('renames an item and keeps the case-insensitive key in step', async () => {
+    const item = await addChawal();
+
+    const { status, body } = await putJson(`/api/items/${item.id}`, { name: '  Chaawal ' });
+
+    assert.equal(status, 200);
+    assert.equal(body.item.name, 'Chaawal');
+    assert.equal((await InventoryItem.findById(item.id).lean()).nameKey, 'chaawal');
+    assert.equal(await InventoryItem.countDocuments({ nameKey: 'chawal' }), 0, 'the old key is gone');
+  });
+
+  it('recomputes the low-stock flag from the new numbers', async () => {
+    const item = await addChawal();
+
+    const { body } = await putJson(`/api/items/${item.id}`, { quantity: 2 });
+    assert.equal(body.item.status, 'Low');
+  });
+
+  it('refuses a rename onto an existing item, whatever the casing', async () => {
+    const item = await addChawal();
+
+    for (const dupe of ['aata', 'AATA', ' Maggi ']) {
+      const clash = await putJson(`/api/items/${item.id}`, { name: dupe });
+      assert.equal(clash.status, 409, `"${dupe}" should clash`);
+      assert.equal(clash.body.code, 'DUPLICATE_ITEM');
+    }
+
+    assert.equal((await InventoryItem.findById(item.id).lean()).name, 'Chawal', 'name unchanged');
+    assert.equal(await qty('Aata'), 20, 'Aata must be untouched');
+  });
+
+  it('lets an item keep its own name when editing other fields', async () => {
+    // The trap: a blanket duplicate check would report the row as clashing with itself.
+    const item = await addChawal();
+    const { status } = await putJson(`/api/items/${item.id}`, { name: 'Chawal', quantity: 7 });
+    assert.equal(status, 200);
+    assert.equal(await qty('Chawal'), 7);
+  });
+
+  it('rejects a negative quantity or threshold on edit', async () => {
+    const item = await addChawal();
+
+    const negQty = await putJson(`/api/items/${item.id}`, { quantity: -1 });
+    assert.equal(negQty.status, 400);
+    assert.equal(negQty.body.code, 'INVALID_ITEM');
+
+    const negThreshold = await putJson(`/api/items/${item.id}`, { lowStockThreshold: -3 });
+    assert.equal(negThreshold.status, 400);
+    assert.match(negThreshold.body.message, /Low stock limit zero ya usse zyada/);
+
+    assert.equal(await qty('Chawal'), 20, 'nothing may be written');
+  });
+
+  it('reports a missing or malformed id as a clean 404', async () => {
+    const gone = await putJson('/api/items/64b7f9c2e13a4d5e6f7a8b9c', { quantity: 1 });
+    assert.equal(gone.status, 404);
+    assert.equal(gone.body.code, 'ITEM_NOT_FOUND');
+
+    const nonsense = await putJson('/api/items/not-an-object-id', { quantity: 1 });
+    assert.equal(nonsense.status, 404, 'a bad id must not become a 500');
+    assert.equal(nonsense.body.code, 'ITEM_NOT_FOUND');
+  });
+
+  it('rejects an empty edit rather than silently doing nothing', async () => {
+    const item = await addChawal();
+    const { status, body } = await putJson(`/api/items/${item.id}`, {});
+    assert.equal(status, 400);
+    assert.equal(body.code, 'INVALID_ITEM');
+  });
+});
+
+describe('delete item', () => {
+  async function addChawal() {
+    const res = await postJson('/api/items', {
+      name: 'Chawal',
+      unit: 'kg',
+      quantity: 20,
+      lowStockThreshold: 5,
+    });
+    assert.equal(res.status, 201);
+    return res.body.item;
+  }
+
+  it('removes the row and drops it from the inventory and dashboard', async () => {
+    const item = await addChawal();
+
+    const { status, body } = await deleteJson(`/api/items/${item.id}`);
+    assert.equal(status, 200);
+    assert.equal(body.status, 'success');
+    assert.equal(body.message, 'Chawal delete kar diya gaya hai.');
+
+    assert.equal(await InventoryItem.findById(item.id), null);
+
+    const inv = await getJson('/api/inventory');
+    assert.equal(inv.body.items.length, 5, 'back to the five seeded items');
+    assert.ok(!inv.body.items.some((i) => i.name === 'Chawal'));
+
+    const dash = await getJson('/api/dashboard');
+    assert.ok(!dash.body.items.some((i) => i.name === 'Chawal'));
+  });
+
+  it('reports a second delete of the same id as a clean 404', async () => {
+    const item = await addChawal();
+    assert.equal((await deleteJson(`/api/items/${item.id}`)).status, 200);
+
+    const again = await deleteJson(`/api/items/${item.id}`);
+    assert.equal(again.status, 404);
+    assert.equal(again.body.code, 'ITEM_NOT_FOUND');
+    assert.ok(!JSON.stringify(again.body).includes('at '), 'no stack frames');
+  });
+
+  it('rejects a malformed id as a 404 rather than a 500', async () => {
+    const { status, body } = await deleteJson('/api/items/nope');
+    assert.equal(status, 404);
+    assert.equal(body.code, 'ITEM_NOT_FOUND');
+  });
+
+  it('leaves a deleted item unresolvable by voice, so a queued sale cannot resurrect it', async () => {
+    const item = await addChawal();
+
+    // A pending confirmation naming Chawal...
+    stubAi({ transcript: '5 kilo chawal bik gaya', intent: 'SALE', item: 'chawal', quantity: 5, unit: 'kg', confidence: 0.4 });
+    const pending = (await postAudio()).body;
+    assert.equal(pending.status, 'needs_confirmation');
+
+    // ...is stranded by deleting the item before the shopkeeper taps Haan.
+    assert.equal((await deleteJson(`/api/items/${item.id}`)).status, 200);
+
+    const done = await postConfirm({ confirmationId: pending.confirmationId });
+    assert.equal(done.body.status, 'error');
+    assert.equal(done.body.code, 'UNKNOWN_ITEM');
+    assert.equal(await InventoryItem.countDocuments({ nameKey: 'chawal' }), 0);
+  });
+});
+
+describe('a newly added item is reachable by voice', () => {
+  it('adds Chawal, then a spoken SALE for "chawal" resolves to it', async () => {
+    const created = await postJson('/api/items', {
+      name: 'Chawal',
+      unit: 'kg',
+      quantity: 20,
+      lowStockThreshold: 5,
+    });
+    assert.equal(created.status, 201);
+
+    stubAi({
+      transcript: '5 kilo chawal bik gaya',
+      intent: 'SALE',
+      item: 'chawal',
+      quantity: 5,
+      unit: 'kg',
+      confidence: 0.95,
+    });
+
+    const { status, body } = await postAudio();
+    assert.equal(status, 200);
+    assert.equal(body.status, 'success', `voice should resolve the new item: ${body.message}`);
+    assert.equal(body.item.name, 'Chawal');
+    assert.equal(body.item.quantity, 15);
+    assert.equal(await qty('Chawal'), 15);
+  });
+
+  it('resolves a new item by casing, spacing and punctuation', async () => {
+    await postJson('/api/items', { name: 'Chawal', unit: 'kg', quantity: 20, lowStockThreshold: 5 });
+
+    for (const spoken of ['Chawal', 'chawal', 'CHAWAL', '  chawal  ', 'chawal.']) {
+      await InventoryItem.updateOne({ name: 'Chawal' }, { $set: { quantity: 20 } });
+      stubAi({ transcript: '1 kilo chawal bik gaya', intent: 'SALE', item: spoken, quantity: 1, unit: 'kg', confidence: 0.95 });
+
+      const { body } = await postAudio();
+      assert.equal(body.status, 'success', `"${spoken}" should resolve`);
+      assert.equal(body.item.name, 'Chawal', `"${spoken}" resolved to the wrong row`);
+    }
+  });
+
+  it('resolves a new item written in Devanagari against its Latin name', async () => {
+    await postJson('/api/items', { name: 'Chawal', unit: 'kg', quantity: 20, lowStockThreshold: 5 });
+
+    stubAi({ transcript: '5 kilo chaawal bik gaya', intent: 'SALE', item: 'चावल', quantity: 5, unit: 'kg', confidence: 0.95 });
+
+    const { body } = await postAudio();
+    assert.equal(body.status, 'success', `Devanagari should resolve: ${body.message}`);
+    assert.equal(body.item.name, 'Chawal');
+    assert.equal(await qty('Chawal'), 15);
+  });
+
+  it('still refuses an item that was never added, and does not create it', async () => {
+    stubAi({ transcript: '2 kilo rajma bik gaya', intent: 'SALE', item: 'rajma', quantity: 2, unit: 'kg', confidence: 0.95 });
+
+    const { body } = await postAudio();
+    assert.equal(body.status, 'error');
+    assert.equal(body.code, 'UNKNOWN_ITEM');
+    assert.equal(await InventoryItem.countDocuments({ nameKey: 'rajma' }), 0);
+  });
+
+  it('builds the model prompt from the database, not the hardcoded seed', async () => {
+    const { catalogueText } = await import('../services/geminiService.js');
+
+    const before = await catalogueText();
+    assert.ok(!before.includes('Chawal'), 'a cache primed before the add must not list it');
+
+    await postJson('/api/items', { name: 'Chawal', unit: 'kg', quantity: 20, lowStockThreshold: 5 });
+
+    const after = await catalogueText();
+    assert.ok(after.includes('Chawal (kg)'), `the new item must be in the prompt list: ${after}`);
+  });
+
+  it('drops a deleted item from the model prompt too', async () => {
+    const { catalogueText } = await import('../services/geminiService.js');
+    const created = await postJson('/api/items', {
+      name: 'Chawal',
+      unit: 'kg',
+      quantity: 20,
+      lowStockThreshold: 5,
+    });
+
+    assert.ok((await catalogueText()).includes('Chawal (kg)'));
+    await deleteJson(`/api/items/${created.body.item.id}`);
+    assert.ok(!(await catalogueText()).includes('Chawal'), 'a deleted item must not stay in the prompt');
   });
 });

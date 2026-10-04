@@ -33,6 +33,58 @@ function messageFromPayload(payload) {
   return CLIENT_ERRORS.UNKNOWN;
 }
 
+/**
+ * The shop key, held in sessionStorage so it survives a refresh but not a closed
+ * tab. It is deliberately NOT in the bundle: anything baked into the JavaScript
+ * is readable by anyone who opens devtools, and this is a secret, not a config.
+ */
+const KEY_STORAGE = 'dukaan-sathi.api-key';
+
+export function getApiKey() {
+  try {
+    return window.sessionStorage.getItem(KEY_STORAGE) || '';
+  } catch {
+    // Private mode / storage disabled: the app still works for this page view
+    // because the key is kept in memory, it just is not remembered.
+    return '';
+  }
+}
+
+export function setApiKey(value) {
+  const key = String(value || '').trim();
+  try {
+    if (key) window.sessionStorage.setItem(KEY_STORAGE, key);
+    else window.sessionStorage.removeItem(KEY_STORAGE);
+  } catch {
+    // ignore - in-memory copy below is enough for this page view
+  }
+  apiKey = key;
+  notifyKeyChange(key);
+  return key;
+}
+
+/** Notified when the key changes, so the gate can re-render. */
+let apiKey = '';
+const keyListeners = new Set();
+
+function notifyKeyChange(key) {
+  for (const fn of keyListeners) fn(key);
+}
+
+export function onApiKeyChange(fn) {
+  keyListeners.add(fn);
+  return () => keyListeners.delete(fn);
+}
+
+apiKey = getApiKey();
+
+/** Headers for every API call: the shop key, plus the usual JSON ask. */
+function authHeaders(extra = {}) {
+  const headers = { Accept: 'application/json', ...extra };
+  if (apiKey) headers['X-API-Key'] = apiKey;
+  return headers;
+}
+
 async function parseResponse(res) {
   let payload = null;
   try {
@@ -53,10 +105,17 @@ async function parseResponse(res) {
   return payload;
 }
 
-/** GET /api/dashboard */
-export async function fetchDashboard() {
+/**
+ * Wrap a fetch so every caller gets the same auth header, the same network
+ * error shape, and one place to react to a rejected key.
+ */
+async function apiFetch(path, options = {}) {
+  const { headers, ...rest } = options;
   try {
-    const res = await fetch(`${BASE_URL}/api/dashboard`, { headers: { Accept: 'application/json' } });
+    const res = await fetch(`${BASE_URL}${path}`, {
+      ...rest,
+      headers: authHeaders(headers),
+    });
     return await parseResponse(res);
   } catch (err) {
     if (err instanceof ApiError) throw err;
@@ -64,15 +123,57 @@ export async function fetchDashboard() {
   }
 }
 
+/** GET /api/dashboard */
+export async function fetchDashboard() {
+  return apiFetch('/api/dashboard');
+}
+
 /** GET /api/inventory */
 export async function fetchInventory() {
-  try {
-    const res = await fetch(`${BASE_URL}/api/inventory`, { headers: { Accept: 'application/json' } });
-    return await parseResponse(res);
-  } catch (err) {
-    if (err instanceof ApiError) throw err;
-    throw new ApiError(CLIENT_ERRORS.NETWORK, 'NETWORK', 0);
+  return apiFetch('/api/inventory');
+}
+
+/* ---------------------------------------------------------------------------
+ * Add / edit / delete an item.
+ *
+ * These are shopkeeper actions, not voice actions: the Gemini layer can never
+ * create, rename or remove a row, so these three are the only paths that can.
+ * ------------------------------------------------------------------------ */
+
+/** The fields the server accepts, with empty strings dropped so a blank box is
+ *  left out of an edit entirely rather than sent as "". */
+function itemPayload(values) {
+  const payload = {};
+  if (values.name !== undefined && values.name !== '') payload.name = values.name;
+  if (values.unit) payload.unit = values.unit;
+  if (values.quantity !== undefined && values.quantity !== '') payload.quantity = values.quantity;
+  if (values.lowStockThreshold !== undefined && values.lowStockThreshold !== '') {
+    payload.lowStockThreshold = values.lowStockThreshold;
   }
+  return payload;
+}
+
+/** POST /api/items */
+export async function createItem(values) {
+  return apiFetch('/api/items', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(itemPayload(values)),
+  });
+}
+
+/** PUT /api/items/:id */
+export async function updateItem(id, values) {
+  return apiFetch(`/api/items/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(itemPayload(values)),
+  });
+}
+
+/** DELETE /api/items/:id */
+export async function deleteItem(id) {
+  return apiFetch(`/api/items/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
 /**
@@ -86,30 +187,19 @@ export async function processVoice(blob, mimeType) {
   // A filename is required for the browser to send a file part.
   form.append('audio', blob, `dukaan-sathi.${extensionFor(mimeType)}`);
 
-  try {
-    const res = await fetch(`${BASE_URL}/api/voice/process`, { method: 'POST', body: form });
-    return await parseResponse(res);
-  } catch (err) {
-    if (err instanceof ApiError) throw err;
-    throw new ApiError(CLIENT_ERRORS.NETWORK, 'NETWORK', 0);
-  }
+  // No explicit Content-Type: the browser must add the multipart boundary itself.
+  return apiFetch('/api/voice/process', { method: 'POST', body: form });
 }
 
 /** POST /api/voice/confirm - applies a pending action the shopkeeper approved. */
 export async function confirmVoiceAction(confirmationId) {
-  try {
-    const res = await fetch(`${BASE_URL}/api/voice/confirm`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      // Only the opaque id is sent. The server ignores anything else and
-      // re-validates the stored action against live stock.
-      body: JSON.stringify({ confirmationId }),
-    });
-    return await parseResponse(res);
-  } catch (err) {
-    if (err instanceof ApiError) throw err;
-    throw new ApiError(CLIENT_ERRORS.NETWORK, 'NETWORK', 0);
-  }
+  return apiFetch('/api/voice/confirm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    // Only the opaque id is sent. The server ignores anything else and
+    // re-validates the stored action against live stock.
+    body: JSON.stringify({ confirmationId }),
+  });
 }
 
 function extensionFor(mimeType) {
@@ -128,6 +218,7 @@ function extensionFor(mimeType) {
     'audio/ogg': 'ogg',
     'audio/opus': 'ogg',
     'audio/flac': 'flac',
+    'audio/x-flac': 'flac',
     'audio/webm': 'webm',
   };
   return map[base] || 'audio';

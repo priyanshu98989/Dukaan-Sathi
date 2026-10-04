@@ -1,10 +1,121 @@
+import { useState } from 'react';
 import { formatQty, formatUnit } from '../services/format.js';
+import { createItem, deleteItem, updateItem } from '../services/api.js';
+import ItemFormDialog from './ItemFormDialog.jsx';
+import DeleteItemDialog from './DeleteItemDialog.jsx';
 
-/** The shop's live stock. Large text on purpose - read it from across the counter. */
-export default function InventoryTable({ items, loading }) {
+/**
+ * The shop's live stock, and the only place items can be added or removed by hand.
+ *
+ * Read from across the counter, so the numbers stay large. The row actions are
+ * deliberately smaller and quieter than the numbers: adding stock is a typo-fix,
+ * not the main event.
+ */
+export default function InventoryTable({ items, loading, onChanged }) {
+  // null = closed, 'new' = adding, or the row being edited.
+  const [formMode, setFormMode] = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+  const [notice, setNotice] = useState(null);
+
+  const closeForm = () => {
+    setFormMode(null);
+    setFormError('');
+  };
+
+  const closeDelete = () => {
+    setDeleteTarget(null);
+    setDeleteError('');
+  };
+
+  const handleSubmit = async (values) => {
+    if (busy) return;
+    setBusy(true);
+    setFormError('');
+    try {
+      const payload =
+        formMode === 'new'
+          ? await createItem(values)
+          : await updateItem(formMode.id, values);
+
+      setNotice({ tone: 'success', message: payload.message });
+      closeForm();
+      await onChanged?.();
+    } catch (err) {
+      // The server already speaks Hinglish, so its message is shown as-is.
+      setFormError(err?.userMessage || 'Item save nahi ho paya.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (busy || !deleteTarget) return;
+    setBusy(true);
+    setDeleteError('');
+    try {
+      const payload = await deleteItem(deleteTarget.id);
+      setNotice({ tone: 'success', message: payload.message });
+      closeDelete();
+      await onChanged?.();
+    } catch (err) {
+      setDeleteError(err?.userMessage || 'Item delete nahi ho paya.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const canEdit = typeof onChanged === 'function';
+
+  function startEdit(item) {
+    setFormError('');
+    setFormMode(item);
+  }
+
+  function startDelete(item) {
+    setDeleteError('');
+    setDeleteTarget(item);
+  }
+
   return (
     <section className="rounded-2xl border-2 border-slate-200 bg-white p-4 sm:p-6">
-      <h2 className="mb-4 text-2xl font-bold text-slate-900">Stock</h2>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <h2 className="text-2xl font-bold text-slate-900">Stock</h2>
+
+        {canEdit ? (
+          <button
+            type="button"
+            onClick={() => {
+              setFormError('');
+              setFormMode('new');
+            }}
+            disabled={loading}
+            className={[
+              'min-h-12 rounded-xl bg-slate-900 px-4 py-2 text-lg font-bold text-white',
+              'focus:outline-none focus-visible:ring-4 focus-visible:ring-slate-400',
+              loading ? 'cursor-not-allowed opacity-50' : 'hover:bg-slate-700 active:bg-slate-800',
+            ].join(' ')}
+          >
+            + Item add karein
+          </button>
+        ) : null}
+      </div>
+
+      {notice ? (
+        <p
+          role="status"
+          className={[
+            'mb-4 rounded-xl border-2 p-3 text-base font-semibold',
+            notice.tone === 'success'
+              ? 'border-emerald-500 bg-emerald-50 text-emerald-900'
+              : 'border-red-400 bg-red-50 text-red-900',
+          ].join(' ')}
+        >
+          {notice.message}
+        </p>
+      ) : null}
 
       {loading ? (
         <p className="py-6 text-center text-lg text-slate-500">Stock load ho raha hai...</p>
@@ -34,6 +145,7 @@ export default function InventoryTable({ items, loading }) {
                     {formatUnit(item.quantity, item.unit)}
                   </span>
                 </p>
+                {canEdit ? <RowActions item={item} onEdit={startEdit} onDelete={startDelete} /> : null}
               </li>
             ))}
           </ul>
@@ -50,6 +162,11 @@ export default function InventoryTable({ items, loading }) {
                 <th scope="col" className="pb-3 text-lg font-bold text-slate-600">
                   Status
                 </th>
+                {canEdit ? (
+                  <th scope="col" className="pb-3 text-right text-lg font-bold text-slate-600">
+                    <span className="sr-only">Actions</span>
+                  </th>
+                ) : null}
               </tr>
             </thead>
             <tbody>
@@ -73,13 +190,60 @@ export default function InventoryTable({ items, loading }) {
                   <td className="py-4">
                     <StatusPill status={item.status} />
                   </td>
+                  {canEdit ? (
+                    <td className="py-4 text-right">
+                      <RowActions item={item} onEdit={startEdit} onDelete={startDelete} />
+                    </td>
+                  ) : null}
                 </tr>
               ))}
             </tbody>
           </table>
         </>
       )}
+
+      {formMode ? (
+        <ItemFormDialog
+          item={formMode === 'new' ? null : formMode}
+          busy={busy}
+          error={formError}
+          onSubmit={handleSubmit}
+          onClose={closeForm}
+        />
+      ) : null}
+
+      <DeleteItemDialog
+        item={deleteTarget}
+        busy={busy}
+        error={deleteError}
+        onConfirm={handleDelete}
+        onClose={closeDelete}
+      />
     </section>
+  );
+}
+
+/** 48px tall so it is tappable with a thumb, in the shop or on a phone. */
+function RowActions({ item, onEdit, onDelete }) {
+  return (
+    <div className="mt-3 flex gap-2 sm:mt-0 sm:justify-end">
+      <button
+        type="button"
+        onClick={() => onEdit(item)}
+        aria-label={`${item.name} badlein`}
+        className="min-h-12 flex-1 rounded-lg border-2 border-slate-300 bg-white px-4 py-2 text-base font-bold text-slate-800 focus:outline-none focus-visible:ring-4 focus-visible:ring-slate-300 hover:bg-slate-50 sm:flex-none"
+      >
+        Badlein
+      </button>
+      <button
+        type="button"
+        onClick={() => onDelete(item)}
+        aria-label={`${item.name} delete karein`}
+        className="min-h-12 flex-1 rounded-lg border-2 border-red-300 bg-white px-4 py-2 text-base font-bold text-red-700 focus:outline-none focus-visible:ring-4 focus-visible:ring-red-300 hover:bg-red-50 sm:flex-none"
+      >
+        Delete
+      </button>
+    </div>
   );
 }
 

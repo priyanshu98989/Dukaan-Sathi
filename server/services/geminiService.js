@@ -16,6 +16,7 @@ import config from '../config/env.js';
 import { logger } from '../utils/logger.js';
 import { AiError, AI_ERRORS } from './aiErrors.js';
 import { SEED_ITEMS } from './itemAliases.js';
+import InventoryItem from '../models/InventoryItem.js';
 
 const TAG = 'gemini';
 
@@ -81,13 +82,68 @@ const AI_OUTPUT_SCHEMA = {
   additionalProperties: false,
 };
 
-const CATALOGUE = SEED_ITEMS.map((i) => `${i.name} (${i.unit})`).join(', ');
+/**
+ * The item list is read from MongoDB, not hardcoded.
+ *
+ * This used to be a module-level string built from SEED_ITEMS, which meant a
+ * newly added item was invisible to the model: it would never be named in the
+ * prompt, so it could never come back out of a spoken command.
+ *
+ * Reading on every request would add a query per voice command, so the list is
+ * cached briefly. The window is short because a stale list is the one failure
+ * mode that matters - the shopkeeper adds "Chawal", immediately says "5 kilo
+ * chawal bik gaya", and is told the item does not exist.
+ */
+const CATALOGUE_TTL_MS = 15_000;
 
-const SYSTEM_INSTRUCTION = `You are the speech-understanding layer of "Dukaan Sathi", a voice inventory assistant for a small Indian kirana shop.
+let catalogueCache = { at: 0, text: '' };
+
+/** Called after any add / edit / delete so the next voice command sees it. */
+export function invalidateCatalogue() {
+  catalogueCache = { at: 0, text: '' };
+}
+
+/**
+ * "Aata (kg), Maggi (packets), ..." from the live collection.
+ *
+ * Falls back to the last known list, then to the seed, so a MongoDB hiccup
+ * degrades to a stale prompt rather than failing the shopkeeper's voice command.
+ *
+ * @returns {Promise<string>}
+ */
+export async function catalogueText() {
+  const now = Date.now();
+  if (catalogueCache.text && now - catalogueCache.at < CATALOGUE_TTL_MS) {
+    return catalogueCache.text;
+  }
+
+  let names;
+  try {
+    const docs = await InventoryItem.find()
+      .sort({ _id: 1 })
+      .select({ name: 1, unit: 1 })
+      .lean();
+    names = docs.map((d) => `${d.name} (${d.unit})`);
+  } catch (err) {
+    logger.warn(TAG, 'catalogue read failed:', err?.message || err);
+    if (catalogueCache.text) return catalogueCache.text;
+    names = SEED_ITEMS.map((i) => `${i.name} (${i.unit})`);
+  }
+
+  catalogueCache = { at: now, text: names.join(', ') };
+  return catalogueCache.text;
+}
+
+/**
+ * @param {string} catalogue "Aata (kg), Maggi (packets)"
+ * @returns {string}
+ */
+function buildSystemInstruction(catalogue) {
+  return `You are the speech-understanding layer of "Dukaan Sathi", a voice inventory assistant for a small Indian kirana shop.
 
 The shopkeeper speaks Hindi or Hinglish (Hindi written in Roman script). You do one job only: transcribe what was said and pull out a structured intent. You never decide inventory outcomes.
 
-The shop currently stocks exactly these items: ${CATALOGUE}.
+The shop currently stocks exactly these items: ${catalogue}.
 
 Choose exactly one intent:
 - SALE - something left the shelf. "5 kilo aata bik gaya", "2 packet maggi bech diye", "tel 3 litre diya".
@@ -100,6 +156,7 @@ Rules:
 - "unit": the unit as spoken, in English ("kg", "kilo", "litre", "packet", "packets"). Use null when no unit was spoken. For a pure CHECK_STOCK question with no unit, put the unit that item is normally measured in.
 - "transcript": the words exactly as spoken, Roman script, no translation, no added punctuation at the end.
 - "confidence": 0 to 1. Be honest. Use below 0.7 when the audio is unclear, the item is ambiguous, or you had to guess the number. Use 0.9 or above only when the audio was clear and the intent was unambiguous.`;
+}
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -157,6 +214,8 @@ function buildTimeoutSignal(ms) {
 async function callGemini({ buffer, mimeType }) {
   const ai = getClient();
   const { signal, cancel } = buildTimeoutSignal(REQUEST_TIMEOUT_MS);
+  // Built per request, because the shop's item list can change at any moment.
+  const systemInstruction = buildSystemInstruction(await catalogueText());
 
   try {
     return await ai.models.generateContent({
@@ -175,7 +234,7 @@ async function callGemini({ buffer, mimeType }) {
         },
       ],
       config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
+        systemInstruction,
         responseMimeType: 'application/json',
         responseJsonSchema: AI_OUTPUT_SCHEMA,
         temperature: 0,
@@ -286,4 +345,5 @@ export async function transcribeAndExtract({ buffer, mimeType }) {
 export function resetClient() {
   client = null;
   override = null;
+  invalidateCatalogue();
 }

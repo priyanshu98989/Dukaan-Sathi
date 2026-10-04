@@ -190,7 +190,9 @@ export default function Dashboard() {
         ) : null}
 
         <LowStockPanel lowStock={lowStock} latestWarning={banner?.warning} />
-        <InventoryTable items={items} loading={loading} />
+        {/* onChanged re-reads the dashboard, so a hand edit updates the low-stock
+            panel and the numbers together instead of drifting apart. */}
+        <InventoryTable items={items} loading={loading} onChanged={refresh} />
         <VoiceActivityLog actions={recentActions} />
       </main>
 

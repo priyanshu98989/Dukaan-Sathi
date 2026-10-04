@@ -1,0 +1,76 @@
+# Render Blueprint for Dukaan Sathi.
+#
+# One web service runs everything: the Express API and the built React SPA are
+# the same Node process, so the browser talks to a single origin and there is no
+# CORS allowlist to keep in sync.
+#
+# The build installs all three workspaces and then builds the client, because
+# `npm start` only serves `client/dist` if it exists at boot.
+
+services:
+  - type: web
+    name: dukaan-sathi
+    runtime: node
+    plan: free
+    region: singapore
+
+    # `install:all` is root + server + client. The build must run before start,
+    # otherwise the server boots with no client and only answers /api.
+    buildCommand: npm run install:all && npm run build
+    startCommand: npm start
+
+    # Hits MongoDB, so a database blip shows up as a failed deploy instead of a
+    # silently broken app.
+    healthCheckPath: /api/health
+
+    # Free instances sleep after 15 minutes idle, so the first voice command
+    # after a gap waits out a cold start. Move to `plan: starter` to remove it.
+    autoDeploy: true
+
+    envVars:
+      # Required, filled in at deploy time. Never committed, never in the bundle.
+      - key: GEMINI_API_KEY
+        sync: false
+
+      # MongoDB Atlas SRV string. The free Render plan has no fixed outbound IP,
+      # so Atlas network access has to allow 0.0.0.0/0 - see README "Deploy".
+      - key: MONGODB_URI
+        sync: false
+
+      # The shop key. Generated once by Render and shown in the dashboard; the
+      # shopkeeper types it into the app on first load.
+      - key: API_KEY
+        generateValue: true
+
+      # Enables HSTS and the production security headers.
+      - key: NODE_ENV
+        value: production
+
+      # Set this to the deployed origin, e.g. https://dukaan-sathi.onrender.com
+      # (comma-separated for extra origins). Leave it unset while the app is
+      # same-origin only: same-origin requests are not subject to CORS.
+      - key: CLIENT_ORIGIN
+        sync: false
+
+      - key: SHOP_NAME
+        value: Sharma General Store
+
+      - key: GEMINI_MODEL
+        value: gemini-flash-lite-latest
+
+      - key: CONFIDENCE_THRESHOLD
+        value: "0.75"
+
+      # Every voice command is one billable Gemini call, so this budget is what
+      # caps the shop's spend if a client misbehaves.
+      - key: RATE_LIMIT_VOICE_MAX
+        value: "20"
+
+      - key: RATE_LIMIT_READ_MAX
+        value: "120"
+
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "60000"
+
+      - key: MAX_AUDIO_BYTES
+        value: "10485760"

@@ -45,6 +45,9 @@ export const FAILURE_CODES = {
   DB_FAILED: 'DB_FAILED',
   CONFIRMATION_EXPIRED: 'CONFIRMATION_EXPIRED',
   CONFIRMATION_NOT_FOUND: 'CONFIRMATION_NOT_FOUND',
+  INVALID_ITEM: 'INVALID_ITEM',
+  DUPLICATE_ITEM: 'DUPLICATE_ITEM',
+  ITEM_NOT_FOUND: 'ITEM_NOT_FOUND',
 };
 
 /** 20 -> "20", 3.5 -> "3.5". Never "20.0". */
@@ -142,3 +145,42 @@ export function lowStockAlert(item) {
 
 export const LOW_STOCK_HEADING = 'Low Stock';
 export const ALL_HEALTHY = '\u2713 All inventory levels are healthy';
+
+/* ---------------------------------------------------------------------------
+ * Item add / edit / delete.
+ *
+ * Every one of these reaches a shopkeeper who is typing on a phone, between
+ * customers. So: Hinglish, one sentence, and say what to do next rather than
+ * naming the field that failed validation.
+ * ------------------------------------------------------------------------ */
+
+/** The three units the shop can count in, for error messages. */
+export const UNIT_CHOICES_HINGLISH = 'kg, L ya packets';
+
+/** "Chawal already inventory mein hai." */
+export function duplicateItemMessage(name) {
+  return `${name} already inventory mein hai. Purana naam edit karne ke liye use karein.`;
+}
+
+/** "Chawal nahi mila. Shayad wo delete ho chuka hai." */
+export function itemNotFoundMessage(name) {
+  const label = String(name || '').trim();
+  return label
+    ? `${label} nahi mila. Shayad wo delete ho chuka hai.`
+    : 'Yeh item nahi mila. List refresh karein.';
+}
+
+/** "Chawal add ho gaya: 20 kg." */
+export function itemAddedMessage(item) {
+  return `${item.name} add ho gaya: ${formatQtyWithUnit(item.quantity, item.unit)}.`;
+}
+
+/** "Chawal update ho gaya." */
+export function itemUpdatedMessage(item) {
+  return `${item.name} update ho gaya: ${formatQtyWithUnit(item.quantity, item.unit)}.`;
+}
+
+/** "Chawal delete kar diya gaya hai." */
+export function itemDeletedMessage(name) {
+  return `${name} delete kar diya gaya hai.`;
+}

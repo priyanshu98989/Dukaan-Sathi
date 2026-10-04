@@ -12,13 +12,31 @@ import fs from 'node:fs';
 import path from 'node:path';
 import config, { REPO_ROOT } from './config/env.js';
 import { connectDb, disconnectDb } from './config/db.js';
-import apiRoutes from './routes/index.js';
+import { createApiRoutes } from './routes/index.js';
 import { errorHandler, notFound } from './middleware/errorHandler.js';
+import { securityHeaders } from './middleware/security.js';
 import { autoSeed } from './seed.js';
 import { logger } from './utils/logger.js';
 import { ERRORS } from './utils/messages.js';
 
 const TAG = 'server';
+
+/**
+ * Origins allowed to call the API.
+ *
+ * CLIENT_ORIGIN may be a comma-separated list, so a shop reachable at both
+ * http://192.168.1.9:5000 and http://shop.local can allow both without a code
+ * change. Reflecting arbitrary origins (the old `origin: true` in production)
+ * is deliberately not done: it would let any webpage on the internet complete a
+ * preflight against this API.
+ */
+function allowedOrigins() {
+  const list = String(config.clientOrigin || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+  return list.length ? list : false;
+}
 
 export function createApp() {
   const app = express();
@@ -26,10 +44,20 @@ export function createApp() {
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
 
+  // Before everything else, so even the 404 and the error handler emit them.
+  app.use(securityHeaders());
+
   app.use(
     cors({
-      origin: config.nodeEnv === 'production' ? true : [config.clientOrigin],
-      methods: ['GET', 'POST', 'OPTIONS'],
+      origin: allowedOrigins(),
+      // PUT / PATCH / DELETE are needed by the item edit and delete endpoints.
+      // Without them a split deploy (Vercel frontend + Render API) fails the
+      // preflight and the browser blocks the request before it is ever sent.
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      // A custom auth header means every cross-origin call is preflighted, so
+      // the allowlist is what actually decides who may talk to the API.
+      allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization', 'Accept'],
+      exposedHeaders: ['RateLimit', 'RateLimit-Policy', 'Retry-After'],
       maxAge: 86400,
     }),
   );
@@ -38,7 +66,7 @@ export function createApp() {
   app.use(express.json({ limit: '32kb' }));
   app.use(express.urlencoded({ extended: false, limit: '32kb' }));
 
-  app.use('/api', apiRoutes);
+  app.use('/api', createApiRoutes());
 
   const clientDist = path.join(REPO_ROOT, 'client', 'dist');
   if (fs.existsSync(clientDist)) {

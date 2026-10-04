@@ -52,6 +52,7 @@ const AI_READABLE = new Set([
   'audio/ogg',
   'audio/opus',
   'audio/flac',
+  'audio/x-flac',
 ]);
 
 /** Pick the best available recording format, or null if nothing is supported. */

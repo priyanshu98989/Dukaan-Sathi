@@ -5,6 +5,7 @@ build/
 .env.local
 .env.*.local
 *.log
+*.err
 npm-debug.log*
 .DS_Store
 Thumbs.db

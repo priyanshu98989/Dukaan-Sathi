@@ -9,7 +9,7 @@
 import mongoose from 'mongoose';
 import config from './config/env.js';
 import InventoryItem from './models/InventoryItem.js';
-import { SEED_ITEMS } from './services/itemAliases.js';
+import { SEED_ITEMS, normaliseKey } from './services/itemAliases.js';
 import { logger } from './utils/logger.js';
 
 const TAG = 'seed';
@@ -31,10 +31,12 @@ export async function seedInventory({ force = false } = {}) {
     logger.info(TAG, `cleared ${existing} existing item(s) for re-seed`);
   }
 
-  // insertMany is a single batch; the unique index on `name` makes this safe
-  // against a concurrent double start-up.
+  // insertMany is a single batch; the unique indexes on `name` and `nameKey`
+  // make this safe against a concurrent double start-up. nameKey is derived here
+  // rather than left to the schema hook so the seeded rows are correct even if a
+  // future Mongoose version skips middleware on insertMany.
   const docs = await InventoryItem.insertMany(
-    SEED_ITEMS.map((i) => ({ ...i })),
+    SEED_ITEMS.map((i) => ({ ...i, nameKey: normaliseKey(i.name) })),
     { ordered: true },
   );
 

@@ -6,6 +6,7 @@
  */
 
 import mongoose from 'mongoose';
+import { normaliseKey } from '../services/itemAliases.js';
 
 const { Schema } = mongoose;
 
@@ -17,6 +18,29 @@ const InventoryItemSchema = new Schema(
       trim: true,
       unique: true,
       maxlength: [60, 'Item name is too long'],
+    },
+    /**
+     * Lower-cased, punctuation-free form of `name`, and the reason "aata" and
+     * "Aata" cannot both exist.
+     *
+     * A MongoDB collation index would do this too, but a stored key keeps the
+     * lookup identical to the normaliseKey() the voice path already uses, so
+     * "Aata" spoken in any casing hits the same row without a second comparison
+     * path.
+     *
+     * The index is partial so it can be built on a database written before this
+     * field existed: MongoDB stores a missing key as null, and a plain unique
+     * index would refuse to build against more than one such row.
+     */
+    nameKey: {
+      type: String,
+      required: [true, 'Item name key is required'],
+      trim: true,
+      maxlength: [60, 'Item name key is too long'],
+      index: {
+        unique: true,
+        partialFilterExpression: { nameKey: { $type: 'string' } },
+      },
     },
     quantity: {
       type: Number,
@@ -48,6 +72,17 @@ const InventoryItemSchema = new Schema(
 /** "Low" when below the threshold - the shopkeeper cares about running out. */
 InventoryItemSchema.virtual('status').get(function status() {
   return this.quantity < this.lowStockThreshold ? 'Low' : 'Normal';
+});
+
+/**
+ * Derive nameKey from name on every create/save, so it can never be forgotten or
+ * left stale after a rename. Updates that go through findOneAndUpdate do not run
+ * document middleware, so those set nameKey explicitly - see inventoryService.
+ */
+InventoryItemSchema.pre('validate', function assignNameKey() {
+  if (typeof this.name === 'string' && this.name.trim()) {
+    this.nameKey = normaliseKey(this.name);
+  }
 });
 
 InventoryItemSchema.set('toJSON', { virtuals: true });

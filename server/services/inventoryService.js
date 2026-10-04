@@ -7,14 +7,19 @@
  * never drive stock below zero even if two voice commands land at once.
  */
 
+import mongoose from 'mongoose';
 import InventoryItem from '../models/InventoryItem.js';
 import VoiceAction from '../models/VoiceAction.js';
 import { logger } from '../utils/logger.js';
-import { resolveItemName, resolveUnit } from './itemAliases.js';
+import { normaliseKey, resolveItemName, resolveUnit, speechSkeleton } from './itemAliases.js';
+import { invalidateCatalogue } from './geminiService.js';
+import { createItemSchema, explain, updateItemSchema } from '../validation/itemValidation.js';
 import {
   FAILURE_CODES,
   INTENTS,
+  duplicateItemMessage,
   insufficientStockMessage,
+  itemNotFoundMessage,
   lowStockAlert,
   lowStockMessage,
   saleSuccessMessage,
@@ -70,6 +75,212 @@ export async function listLowStock() {
   return docs.filter(isLow).map((d) => toClientItem(d));
 }
 
+/* ---------------------------------------------------------------------------
+ * Add / edit / delete
+ *
+ * These are the only ways an inventory row is ever created or removed. The voice
+ * layer still cannot do either: it can only name an item that is already here.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * A bad :id in the URL would make findById throw a CastError and surface as a
+ * 500, so it is turned into the same clean 404 as a missing row.
+ *
+ * @param {unknown} id
+ * @returns {boolean}
+ */
+function isUsableId(id) {
+  return typeof id === 'string' && mongoose.isValidObjectId(id);
+}
+
+/**
+ * Case-insensitive duplicate guard.
+ *
+ * Checked in application code rather than relying on the unique index alone, so
+ * the shopkeeper gets "Chawal already inventory mein hai" instead of a raw
+ * E11000. The index still exists as the race-condition backstop - two taps on a
+ * slow phone can pass this check at the same moment.
+ *
+ * @param {string} nameKey
+ * @param {string|null} excludeId row being edited, which does not clash with itself
+ */
+async function findNameClash(nameKey, excludeId = null) {
+  const clash = await InventoryItem.findOne({ nameKey }).select('_id').lean();
+  if (!clash) return null;
+  if (excludeId && String(clash._id) === String(excludeId)) return null;
+  return clash;
+}
+
+const DUPLICATE_KEY_CODE = 11000;
+
+/**
+ * Add an item.
+ *
+ * @param {unknown} input raw request body
+ * @returns {Promise<{ok: true, item: object} | {ok: false, code: string, message: string, status: number}>}
+ */
+export async function createItem(input) {
+  const parsed = createItemSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      code: FAILURE_CODES.INVALID_ITEM,
+      message: explain(parsed.error),
+      status: 400,
+    };
+  }
+
+  const { name, unit, quantity, lowStockThreshold } = parsed.data;
+  const nameKey = normaliseKey(name);
+
+  if (await findNameClash(nameKey)) {
+    return {
+      ok: false,
+      code: FAILURE_CODES.DUPLICATE_ITEM,
+      message: duplicateItemMessage(name),
+      status: 409,
+    };
+  }
+
+  try {
+    const created = await InventoryItem.create({
+      name,
+      nameKey,
+      unit,
+      quantity,
+      lowStockThreshold,
+    });
+    // The voice prompt's item list is now out of date.
+    invalidateCatalogue();
+    logger.info(TAG, `ADD_ITEM ${created.name} (${created.unit}), qty ${created.quantity}`);
+    return { ok: true, item: toClientItem(created) };
+  } catch (err) {
+    // Lost the race against a concurrent insert, or against the index itself.
+    if (err?.code === DUPLICATE_KEY_CODE) {
+      return {
+        ok: false,
+        code: FAILURE_CODES.DUPLICATE_ITEM,
+        message: duplicateItemMessage(name),
+        status: 409,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Edit an item. Every field is optional, so correcting a quantity does not force
+ * the shopkeeper to retype the name and unit.
+ *
+ * @param {unknown} id
+ * @param {unknown} input raw request body
+ * @returns {Promise<{ok: true, item: object} | {ok: false, code: string, message: string, status: number}>}
+ */
+export async function updateItem(id, input) {
+  const parsed = updateItemSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      code: FAILURE_CODES.INVALID_ITEM,
+      message: explain(parsed.error),
+      status: 400,
+    };
+  }
+
+  const patch = parsed.data;
+  const keys = Object.keys(patch);
+  if (keys.length === 0) {
+    return {
+      ok: false,
+      code: FAILURE_CODES.INVALID_ITEM,
+      message: 'Kuch badalne ke liye koi field nahi mili. Page refresh karein.',
+      status: 400,
+    };
+  }
+
+  if (!isUsableId(id)) {
+    return { ok: false, code: FAILURE_CODES.ITEM_NOT_FOUND, message: itemNotFoundMessage(), status: 404 };
+  }
+
+  const current = await InventoryItem.findById(id).select('_id').lean();
+  if (!current) {
+    return { ok: false, code: FAILURE_CODES.ITEM_NOT_FOUND, message: itemNotFoundMessage(), status: 404 };
+  }
+
+  const update = {};
+
+  if (patch.name !== undefined) {
+    const nameKey = normaliseKey(patch.name);
+    if (await findNameClash(nameKey, id)) {
+      return {
+        ok: false,
+        code: FAILURE_CODES.DUPLICATE_ITEM,
+        message: duplicateItemMessage(patch.name),
+        status: 409,
+      };
+    }
+    update.name = patch.name;
+    // findByIdAndUpdate does not run document middleware, so nameKey - which the
+    // pre('validate') hook would normally derive - is set explicitly here.
+    update.nameKey = nameKey;
+  }
+
+  if (patch.unit !== undefined) update.unit = patch.unit;
+  if (patch.quantity !== undefined) update.quantity = patch.quantity;
+  if (patch.lowStockThreshold !== undefined) update.lowStockThreshold = patch.lowStockThreshold;
+
+  try {
+    const updated = await InventoryItem.findByIdAndUpdate(
+      id,
+      { $set: { ...update, updatedAt: new Date() } },
+      { returnDocument: 'after', runValidators: true },
+    );
+
+    if (!updated) {
+      return { ok: false, code: FAILURE_CODES.ITEM_NOT_FOUND, message: itemNotFoundMessage(), status: 404 };
+    }
+
+    invalidateCatalogue();
+    logger.info(TAG, `EDIT_ITEM ${updated.name} (${updated.unit}), qty ${updated.quantity}`);
+    return { ok: true, item: toClientItem(updated) };
+  } catch (err) {
+    if (err?.code === DUPLICATE_KEY_CODE) {
+      return {
+        ok: false,
+        code: FAILURE_CODES.DUPLICATE_ITEM,
+        message: duplicateItemMessage(patch.name ?? ''),
+        status: 409,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Delete an item.
+ *
+ * Any confirmation still waiting in the pending queue names this item; when it
+ * is confirmed, applyIntent re-reads by name, finds nothing and returns
+ * UNKNOWN_ITEM. So a delete cannot be followed by a stale write landing back.
+ *
+ * @param {unknown} id
+ * @returns {Promise<{ok: true, item: object} | {ok: false, code: string, message: string, status: number}>}
+ */
+export async function deleteItem(id) {
+  if (!isUsableId(id)) {
+    return { ok: false, code: FAILURE_CODES.ITEM_NOT_FOUND, message: itemNotFoundMessage(), status: 404 };
+  }
+
+  const removed = await InventoryItem.findByIdAndDelete(id);
+  if (!removed) {
+    return { ok: false, code: FAILURE_CODES.ITEM_NOT_FOUND, message: itemNotFoundMessage(), status: 404 };
+  }
+
+  invalidateCatalogue();
+  logger.info(TAG, `DELETE_ITEM ${removed.name}`);
+  return { ok: true, item: toClientItem(removed) };
+}
+
 /** Most recent voice actions first, for the activity log. */
 export async function listRecentActions(limit = 15) {
   const docs = await VoiceAction.find().sort({ createdAt: -1 }).limit(limit).lean();
@@ -83,6 +294,57 @@ export async function listRecentActions(limit = 15) {
     lowStock: d.lowStock,
     createdAt: d.createdAt,
   }));
+}
+
+/**
+ * Find the inventory row a spoken item name refers to.
+ *
+ * Order matters and is the whole point:
+ *
+ *   1. the hand-written alias table, so every seeded spelling keeps working
+ *      exactly as before ("aata" / "Aata" / "आटा" / "atta" -> Aata);
+ *   2. an exact case-insensitive match on a stored item's name, which is what
+ *      makes a freshly added item reachable by voice;
+ *   3. a consonant-skeleton match, so the same item written in Devanagari
+ *      resolves against a Latin name (and vice versa).
+ *
+ * Returns null when nothing matches. This never creates anything: a spoken name
+ * that is not in the database stays an unknown item, which is the rule that keeps
+ * a hallucination from inventing stock.
+ *
+ * @param {string} label spoken or AI-supplied item name
+ * @returns {Promise<object|null>} a Mongoose document
+ */
+export async function resolveSpokenItem(label) {
+  const text = typeof label === 'string' ? label.trim() : '';
+  if (!text) return null;
+
+  // 1. Seeded aliases first, so existing behaviour is untouched.
+  const canonicalName = resolveItemName(text);
+  if (canonicalName) {
+    const seeded = await InventoryItem.findOne({ name: canonicalName });
+    if (seeded) return seeded;
+    // The alias pointed at a name the shop has since deleted. Keep going: the
+    // shopkeeper may have re-added the same item under a different spelling.
+  }
+
+  // 2. Case-insensitive exact match on any stored item.
+  const key = normaliseKey(text);
+  if (key) {
+    const exact = await InventoryItem.findOne({ nameKey: key });
+    if (exact) return exact;
+  }
+
+  // 3. Cross-script match. A miss here is a miss, not a wrong answer - better to
+  //    report an unknown item than to move the wrong stock.
+  const wanted = speechSkeleton(text);
+  if (wanted) {
+    const docs = await InventoryItem.find().sort({ _id: 1 }).lean();
+    const match = docs.find((d) => speechSkeleton(d.name) === wanted);
+    if (match) return match;
+  }
+
+  return null;
 }
 
 /**
@@ -104,26 +366,16 @@ export async function validateIntent(ai) {
     };
   }
 
-  // --- item must exist in the seeded inventory. Never auto-create. ---
+  // --- the item must already exist. Alias table, then the database. ---
   const itemLabel = typeof ai?.item === 'string' ? ai.item.trim() : '';
-  const canonicalName = itemLabel ? resolveItemName(itemLabel) : null;
+  const item = itemLabel ? await resolveSpokenItem(itemLabel) : null;
 
-  if (!canonicalName) {
-    return {
-      ok: false,
-      code: FAILURE_CODES.UNKNOWN_ITEM,
-      message: unknownItemMessage(itemLabel),
-      itemLabel: itemLabel || null,
-    };
-  }
-
-  const item = await InventoryItem.findOne({ name: canonicalName });
   if (!item) {
     return {
       ok: false,
       code: FAILURE_CODES.UNKNOWN_ITEM,
       message: unknownItemMessage(itemLabel),
-      itemLabel,
+      itemLabel: itemLabel || null,
     };
   }
 
