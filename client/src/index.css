@@ -1,0 +1,29 @@
+@import 'tailwindcss';
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    'Noto Sans Devanagari',
+    Roboto,
+    sans-serif;
+  /* Comfortable tap targets for a shopkeeper on a phone. */
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Keep long Hinglish words from overflowing on narrow screens. */
+p,
+th,
+td,
+li,
+h1,
+h2,
+h3 {
+  overflow-wrap: break-word;
+}
