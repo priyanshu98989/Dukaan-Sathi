@@ -32,7 +32,7 @@ export const config = {
   port: PORT,
   mongoUri: required('MONGODB_URI', process.env.MONGODB_URI),
   geminiApiKey: required('GEMINI_API_KEY', process.env.GEMINI_API_KEY),
-  geminiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+  geminiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
   clientOrigin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
   confidenceThreshold: num('CONFIDENCE_THRESHOLD', process.env.CONFIDENCE_THRESHOLD, 0.75),
   maxAudioBytes: num('MAX_AUDIO_BYTES', process.env.MAX_AUDIO_BYTES, 10 * 1024 * 1024),
