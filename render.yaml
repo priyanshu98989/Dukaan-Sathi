@@ -1,8 +1,11 @@
-# Render Blueprint for Dukaan Sathi.
+# Render Blueprint for Dukaan Sathi — API only.
 #
-# One web service runs everything: the Express API and the built React SPA are
-# the same Node process, so the browser talks to a single origin and there is no
-# CORS allowlist to keep in sync. The plan is free.
+# The React SPA is deployed separately, to Vercel, so this service does one job:
+# the JSON API and its connection to MongoDB. That split is worth it because the
+# API has to sit still between calls (see the rate-limit note below) while the
+# SPA is served from a CDN with no cold start at all.
+#
+# The API is still CORS-locked to wherever the SPA lives, via CLIENT_ORIGIN.
 #
 # The database is MongoDB Atlas M0, not something on Render. That is a cost
 # decision, not an oversight: Render has no free tier for private services, and a
@@ -20,18 +23,18 @@
 
 services:
   - type: web
-    name: dukaan-sathi
+    name: dukaan-sathi-api
     runtime: node
     plan: free
     region: singapore
 
-    # `install:all` covers root + server + client. The client build has to happen
-    # before start, or the server boots with no client and answers only /api.
-    buildCommand: npm run install:all && npm run build
-    startCommand: npm start
+    # Server dependencies only. The client is not built here, so `npm start`
+    # finds no client/dist and serves the API alone - which is the point.
+    buildCommand: npm --prefix server install
+    startCommand: npm --prefix server start
 
     # Hits MongoDB, so an unreachable database fails the deploy instead of
-    # shipping an app that 500s on the first page load.
+    # shipping an API that 500s on the first call.
     healthCheckPath: /api/health
 
     envVars:
@@ -44,6 +47,12 @@ services:
       - key: MONGODB_URI
         sync: false
 
+      # The Vercel origin, e.g. https://dukaan-sathi.vercel.app. Required now that
+      # the SPA is cross-origin: without it the browser blocks every call. Comma-
+      # separated if you later add a second frontend host.
+      - key: CLIENT_ORIGIN
+        sync: false
+
       # The shop key. Generated once by Render and read off the dashboard; the
       # shopkeeper types it into the app on first load.
       - key: API_KEY
@@ -53,26 +62,22 @@ services:
       - key: NODE_ENV
         value: production
 
-      # Optional. Only matters for cross-origin calls, and the SPA is served by
-      # this same process, so same-origin requests are not subject to CORS and
-      # leaving this blank still works. Set it if you later split the client onto
-      # its own host.
-      - key: CLIENT_ORIGIN
-        sync: false
-
       - key: SHOP_NAME
         value: Sharma General Store
 
       - key: GEMINI_MODEL
-        value: gemini-flash-lite-latest
+        value: gemini-3.5-flash-lite
 
       - key: CONFIDENCE_THRESHOLD
         value: "0.75"
 
       # Every voice command is one billable Gemini call, so this budget is what
-      # caps what a misbehaving client can spend.
+      # caps what a misbehaving client can spend. Held at 10 because Gemini's own
+      # free tier allows roughly 15 requests per minute: setting this higher just
+      # moves the 429 from our limiter to theirs, and the shopkeeper sees a less
+      # helpful message. Raise it if you enable billing.
       - key: RATE_LIMIT_VOICE_MAX
-        value: "20"
+        value: "10"
 
       - key: RATE_LIMIT_READ_MAX
         value: "120"
