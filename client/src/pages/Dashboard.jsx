@@ -12,6 +12,7 @@ import LowStockPanel from '../components/LowStockPanel.jsx';
 import VoiceActivityLog from '../components/VoiceActivityLog.jsx';
 import ConfirmDialog from '../components/ConfirmDialog.jsx';
 import StatusBanner from '../components/StatusBanner.jsx';
+import AppFooter from '../components/AppFooter.jsx';
 import { useRecorder } from '../hooks/useRecorder.js';
 import { useDashboard } from '../hooks/useDashboard.js';
 import { speak, stopSpeaking } from '../hooks/useSpeech.js';
@@ -195,6 +196,8 @@ export default function Dashboard() {
         <InventoryTable items={items} loading={loading} onChanged={refresh} />
         <VoiceActivityLog actions={recentActions} />
       </main>
+
+      <AppFooter />
 
       <ConfirmDialog
         pending={pending}
